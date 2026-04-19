@@ -102,6 +102,9 @@
       let myRoomCode = null;
       let state = null;
       let lastEventTime = 0;
+      let pollSeq = 0;
+      let lastAppliedPollSeq = 0;
+      let joining = false;
       const keys = { up: false, down: false, left: false, right: false };
 
       function setMessage(text) {
@@ -129,22 +132,31 @@
       }
 
       async function enterRoom(create) {
+        if (joining) return;
+        joining = true;
+        joinBtn.disabled = true;
+        createBtn.disabled = true;
         const name = (nameInput.value || '').trim();
         const roomCode = normalizeRoomCode(roomInput.value);
+        try {
+          const result = await postJson('/join', { name, roomCode, create });
+          if (result.error) {
+            statusEl.textContent = 'Estado: No se pudo entrar';
+            setMessage(result.error);
+            return;
+          }
 
-        const result = await postJson('/join', { name, roomCode, create });
-        if (result.error) {
-          statusEl.textContent = 'Estado: No se pudo entrar';
-          setMessage(result.error);
-          return;
+          myId = result.playerId;
+          myRoomCode = result.roomCode;
+          roomInput.value = myRoomCode;
+          roomCodeEl.textContent = myRoomCode;
+          statusEl.textContent = `Estado: En sala ${myRoomCode}. Muévete con WASD o flechas.`;
+          setMessage(`Entraste a la sala ${myRoomCode}. Comparte ese código con tus amigos.`);
+        } finally {
+          joining = false;
+          joinBtn.disabled = false;
+          createBtn.disabled = false;
         }
-
-        myId = result.playerId;
-        myRoomCode = result.roomCode;
-        roomInput.value = myRoomCode;
-        roomCodeEl.textContent = myRoomCode;
-        statusEl.textContent = `Estado: En sala ${myRoomCode}. Muévete con WASD o flechas.`;
-        setMessage(`Entraste a la sala ${myRoomCode}. Comparte ese código con tus amigos.`);
       }
 
       async function sendInput() {
@@ -179,9 +191,14 @@
       createBtn.addEventListener('click', () => enterRoom(true));
 
       async function pollState() {
+        const requestedPlayerId = myId;
+        const seq = ++pollSeq;
         try {
-          const res = await fetch(`/state?playerId=${encodeURIComponent(myId || '')}`, { cache: 'no-store' });
-          state = await res.json();
+          const res = await fetch(`/state?playerId=${encodeURIComponent(requestedPlayerId || '')}`, { cache: 'no-store' });
+          const nextState = await res.json();
+          if (seq < lastAppliedPollSeq) return;
+          lastAppliedPollSeq = seq;
+          state = nextState;
 
           if (state.roomCode) {
             roomCodeEl.textContent = state.roomCode;
@@ -200,7 +217,7 @@
             const me = state.players[myId];
             const cls = me.isIt ? 'tagged' : 'not-tagged';
             statusEl.innerHTML = `Estado: Sala <span class="room-code">${myRoomCode}</span> | <span class="${cls}">${me.isIt ? 'ERES LA LLEVA' : 'No eres la lleva'}</span> | Jugadores: ${state.playerCount}/4`;
-          } else if (myId && (!state.players || !state.players[myId])) {
+          } else if (myId && requestedPlayerId === myId && (!state.players || !state.players[myId])) {
             myId = null;
             myRoomCode = null;
             roomCodeEl.textContent = '-';
