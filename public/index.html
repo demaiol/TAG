@@ -60,6 +60,10 @@
       .tagged { color: var(--danger); font-weight: 700; }
       .not-tagged { color: var(--ok); font-weight: 700; }
       .room-code { font-weight: 700; letter-spacing: 1px; }
+      .ended-banner {
+        color: #ffd166;
+        font-weight: 700;
+      }
       @media (max-width: 900px) {
         .hud { flex-direction: column; align-items: stretch; }
       }
@@ -71,12 +75,14 @@
         <div class="card row">
           <input id="name" placeholder="Tu nombre" maxlength="20" />
           <input id="room" placeholder="Código sala (ej: AB12CD)" maxlength="12" />
+          <input id="duration" type="number" min="1" max="60" value="5" title="Duración en minutos" />
           <button id="create">Crear sala</button>
           <button id="join">Unirse</button>
         </div>
         <div class="card" id="status">Estado: Elige crear o unirte a una sala.</div>
         <div class="card" id="messages">Bienvenido al TAG online.</div>
         <div class="card">Sala: <span id="roomCode" class="room-code">-</span></div>
+        <div class="card">Tiempo: <span id="timer" class="room-code">--:--</span></div>
         <div class="card leaderboard">
           <strong>Ranking (tiempo sin ser "la lleva")</strong>
           <ol id="scores"></ol>
@@ -93,8 +99,10 @@
       const messagesEl = document.getElementById('messages');
       const scoresEl = document.getElementById('scores');
       const roomCodeEl = document.getElementById('roomCode');
+      const timerEl = document.getElementById('timer');
       const nameInput = document.getElementById('name');
       const roomInput = document.getElementById('room');
+      const durationInput = document.getElementById('duration');
       const joinBtn = document.getElementById('join');
       const createBtn = document.getElementById('create');
 
@@ -118,6 +126,12 @@
         return `${m}:${s}`;
       }
 
+      function sanitizeDurationMinutes(value) {
+        const parsed = Number(value);
+        if (!Number.isFinite(parsed)) return 5;
+        return Math.max(1, Math.min(60, Math.round(parsed)));
+      }
+
       function normalizeRoomCode(code) {
         return String(code || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 12);
       }
@@ -138,8 +152,15 @@
         createBtn.disabled = true;
         const name = (nameInput.value || '').trim();
         const roomCode = normalizeRoomCode(roomInput.value);
+        const durationMinutes = sanitizeDurationMinutes(durationInput.value);
+        durationInput.value = String(durationMinutes);
         try {
-          const result = await postJson('/join', { name, roomCode, create });
+          const result = await postJson('/join', {
+            name,
+            roomCode,
+            create,
+            durationMinutes,
+          });
           if (result.error) {
             statusEl.textContent = 'Estado: No se pudo entrar';
             setMessage(result.error);
@@ -204,6 +225,7 @@
             roomCodeEl.textContent = state.roomCode;
             myRoomCode = state.roomCode;
           }
+          timerEl.textContent = fmtMs(state.remainingMs || 0);
 
           if (state.events && state.events.length) {
             const newest = state.events[state.events.length - 1];
@@ -216,11 +238,16 @@
           if (myId && state.players && state.players[myId]) {
             const me = state.players[myId];
             const cls = me.isIt ? 'tagged' : 'not-tagged';
-            statusEl.innerHTML = `Estado: Sala <span class="room-code">${myRoomCode}</span> | <span class="${cls}">${me.isIt ? 'ERES LA LLEVA' : 'No eres la lleva'}</span> | Jugadores: ${state.playerCount}/4`;
+            if (state.gameEnded) {
+              statusEl.innerHTML = `Estado: Sala <span class="room-code">${myRoomCode}</span> | <span class="ended-banner">PARTIDA TERMINADA</span> | Ganador: ${state.winnerName || 'Sin ganador'}`;
+            } else {
+              statusEl.innerHTML = `Estado: Sala <span class="room-code">${myRoomCode}</span> | <span class="${cls}">${me.isIt ? 'ERES LA LLEVA' : 'No eres la lleva'}</span> | Jugadores: ${state.playerCount}/4`;
+            }
           } else if (myId && requestedPlayerId === myId && (!state.players || !state.players[myId])) {
             myId = null;
             myRoomCode = null;
             roomCodeEl.textContent = '-';
+            timerEl.textContent = '--:--';
             statusEl.textContent = 'Estado: Ya no estás en una sala. Crea o únete de nuevo.';
           } else {
             statusEl.textContent = 'Estado: Elige crear o unirte a una sala.';
@@ -282,6 +309,20 @@
           ctx.font = '14px sans-serif';
           ctx.textAlign = 'center';
           ctx.fillText(player.name, player.x, player.y - player.radius - 10);
+        }
+
+        if (state.gameEnded) {
+          ctx.save();
+          ctx.fillStyle = 'rgba(0,0,0,0.45)';
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+          ctx.fillStyle = '#ffd166';
+          ctx.font = '700 36px sans-serif';
+          ctx.textAlign = 'center';
+          ctx.fillText('PARTIDA TERMINADA', canvas.width / 2, canvas.height / 2 - 10);
+          ctx.font = '600 24px sans-serif';
+          ctx.fillStyle = '#ffffff';
+          ctx.fillText(`Ganador: ${state.winnerName || 'Sin ganador'}`, canvas.width / 2, canvas.height / 2 + 30);
+          ctx.restore();
         }
 
         requestAnimationFrame(draw);

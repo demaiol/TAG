@@ -13,8 +13,10 @@ const TAG_DISTANCE = PLAYER_RADIUS * 2 + 4;
 const TAG_COOLDOWN_MS = 1200;
 const PLAYER_TIMEOUT_MS = 15000;
 const ROOM_CODE_LEN = 6;
+const MIN_DURATION_MIN = 1;
+const MAX_DURATION_MIN = 60;
 
-/** @type {Record<string, {code: string, players: Record<string, any>, itId: string | null, lastTagAt: number, lastTick: number, recentEvents: Array<{at:number,type:string,message:string}>}>} */
+/** @type {Record<string, {code: string, players: Record<string, any>, itId: string | null, lastTagAt: number, lastTick: number, recentEvents: Array<{at:number,type:string,message:string}>, gameDurationMs: number, startedAt: number, endedAt: number | null, winnerName: string | null}>} */
 const rooms = {};
 /** @type {Record<string, string>} */
 const playerRoomById = {};
@@ -32,6 +34,12 @@ function sanitizeName(name) {
 function sanitizeRoomCode(code) {
   if (typeof code !== 'string') return '';
   return code.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 12);
+}
+
+function sanitizeDurationMinutes(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 5;
+  return clamp(Math.round(parsed), MIN_DURATION_MIN, MAX_DURATION_MIN);
 }
 
 function randomRoomCode() {
@@ -55,7 +63,7 @@ function getRoom(code) {
   return rooms[code] || null;
 }
 
-function createRoom(roomCode) {
+function createRoom(roomCode, durationMinutes) {
   const code = sanitizeRoomCode(roomCode) || generateUniqueRoomCode();
   if (rooms[code]) return null;
   rooms[code] = {
@@ -65,6 +73,10 @@ function createRoom(roomCode) {
     lastTagAt: 0,
     lastTick: nowMs(),
     recentEvents: [],
+    gameDurationMs: sanitizeDurationMinutes(durationMinutes) * 60 * 1000,
+    startedAt: nowMs(),
+    endedAt: null,
+    winnerName: null,
   };
   return rooms[code];
 }
@@ -103,6 +115,16 @@ function ensureValidIt(room) {
   }
 }
 
+function roomRemainingMs(room) {
+  if (room.endedAt) return 0;
+  return Math.max(0, room.gameDurationMs - (nowMs() - room.startedAt));
+}
+
+function roomWinnerName(room) {
+  const rows = Object.values(room.players).sort((a, b) => b.notItTimeMs - a.notItTimeMs);
+  return rows.length ? rows[0].name : null;
+}
+
 function buildRoomState(room) {
   return {
     roomCode: room.code,
@@ -110,6 +132,10 @@ function buildRoomState(room) {
     height: HEIGHT,
     maxPlayers: MAX_PLAYERS,
     playerCount: roomPlayerCount(room),
+    durationMinutes: Math.round(room.gameDurationMs / 60000),
+    remainingMs: roomRemainingMs(room),
+    gameEnded: Boolean(room.endedAt),
+    winnerName: room.winnerName,
     itId: room.itId,
     players: Object.fromEntries(
       Object.entries(room.players).map(([id, p]) => [
@@ -191,6 +217,28 @@ function updateRoom(room) {
   room.lastTick = current;
 
   if (!roomPlayerCount(room)) {
+    return;
+  }
+
+  if (!room.endedAt && roomRemainingMs(room) <= 0) {
+    room.endedAt = nowMs();
+    room.winnerName = roomWinnerName(room);
+    pushRoomEvent(
+      room,
+      'system',
+      room.winnerName
+        ? `Fin de partida. Ganó ${room.winnerName}.`
+        : 'Fin de partida. No hubo ganador.'
+    );
+  }
+
+  if (room.endedAt) {
+    const cutoffEnded = nowMs() - PLAYER_TIMEOUT_MS;
+    for (const p of Object.values(room.players)) {
+      if (p.lastSeenAt < cutoffEnded) {
+        removePlayer(p.id, 'se desconectó');
+      }
+    }
     return;
   }
 
@@ -306,6 +354,7 @@ const server = http.createServer(async (req, res) => {
       const name = sanitizeName(body.name);
       const requestedCode = sanitizeRoomCode(body.roomCode);
       const create = Boolean(body.create);
+      const durationMinutes = sanitizeDurationMinutes(body.durationMinutes);
 
       let room = null;
 
@@ -313,7 +362,7 @@ const server = http.createServer(async (req, res) => {
         if (requestedCode && rooms[requestedCode]) {
           return sendJson(res, 409, { error: 'Ese código de sala ya existe.' });
         }
-        room = createRoom(requestedCode || generateUniqueRoomCode());
+        room = createRoom(requestedCode || generateUniqueRoomCode(), durationMinutes);
       } else {
         if (!requestedCode) {
           return sendJson(res, 400, { error: 'Debes ingresar un código de sala.' });
@@ -321,6 +370,9 @@ const server = http.createServer(async (req, res) => {
         room = getRoom(requestedCode);
         if (!room) {
           return sendJson(res, 404, { error: 'La sala no existe.' });
+        }
+        if (room.endedAt) {
+          return sendJson(res, 403, { error: 'Esa partida ya terminó. Crea otra sala.' });
         }
       }
 
@@ -336,7 +388,12 @@ const server = http.createServer(async (req, res) => {
       ensureValidIt(room);
       pushRoomEvent(room, 'system', `${room.players[playerId].name} se unió (${roomPlayerCount(room)}/${MAX_PLAYERS})`);
 
-      return sendJson(res, 200, { playerId, roomCode: room.code, maxPlayers: MAX_PLAYERS });
+      return sendJson(res, 200, {
+        playerId,
+        roomCode: room.code,
+        maxPlayers: MAX_PLAYERS,
+        durationMinutes: Math.round(room.gameDurationMs / 60000),
+      });
     } catch (err) {
       return sendJson(res, 400, { error: `Solicitud inválida: ${err.message}` });
     }
@@ -351,6 +408,7 @@ const server = http.createServer(async (req, res) => {
       if (!player) return sendJson(res, 404, { error: 'Jugador no encontrado' });
 
       const input = body.input || {};
+      if (room.endedAt) return sendJson(res, 200, { ok: true, ended: true });
       player.input.up = Boolean(input.up);
       player.input.down = Boolean(input.down);
       player.input.left = Boolean(input.left);
@@ -385,6 +443,10 @@ const server = http.createServer(async (req, res) => {
         height: HEIGHT,
         maxPlayers: MAX_PLAYERS,
         playerCount: 0,
+        durationMinutes: 0,
+        remainingMs: 0,
+        gameEnded: false,
+        winnerName: null,
         itId: null,
         players: {},
         leaderboard: [],
