@@ -40,7 +40,7 @@
         border-radius: 14px;
         display: block;
       }
-      .row { display: flex; gap: 8px; align-items: center; }
+      .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
       input, button {
         border-radius: 8px;
         border: 1px solid rgba(255,255,255,.2);
@@ -59,6 +59,7 @@
       .leaderboard ol { margin: 8px 0 0; padding-left: 20px; }
       .tagged { color: var(--danger); font-weight: 700; }
       .not-tagged { color: var(--ok); font-weight: 700; }
+      .room-code { font-weight: 700; letter-spacing: 1px; }
       @media (max-width: 900px) {
         .hud { flex-direction: column; align-items: stretch; }
       }
@@ -69,10 +70,13 @@
       <section class="hud">
         <div class="card row">
           <input id="name" placeholder="Tu nombre" maxlength="20" />
-          <button id="join">Entrar</button>
+          <input id="room" placeholder="Código sala (ej: AB12CD)" maxlength="12" />
+          <button id="create">Crear sala</button>
+          <button id="join">Unirse</button>
         </div>
-        <div class="card" id="status">Estado: Conectando...</div>
+        <div class="card" id="status">Estado: Elige crear o unirte a una sala.</div>
         <div class="card" id="messages">Bienvenido al TAG online.</div>
+        <div class="card">Sala: <span id="roomCode" class="room-code">-</span></div>
         <div class="card leaderboard">
           <strong>Ranking (tiempo sin ser "la lleva")</strong>
           <ol id="scores"></ol>
@@ -88,10 +92,14 @@
       const statusEl = document.getElementById('status');
       const messagesEl = document.getElementById('messages');
       const scoresEl = document.getElementById('scores');
+      const roomCodeEl = document.getElementById('roomCode');
       const nameInput = document.getElementById('name');
+      const roomInput = document.getElementById('room');
       const joinBtn = document.getElementById('join');
+      const createBtn = document.getElementById('create');
 
       let myId = null;
+      let myRoomCode = null;
       let state = null;
       let lastEventTime = 0;
       const keys = { up: false, down: false, left: false, right: false };
@@ -107,6 +115,10 @@
         return `${m}:${s}`;
       }
 
+      function normalizeRoomCode(code) {
+        return String(code || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 12);
+      }
+
       async function postJson(url, payload) {
         const res = await fetch(url, {
           method: 'POST',
@@ -116,16 +128,23 @@
         return res.json();
       }
 
-      async function joinGame() {
+      async function enterRoom(create) {
         const name = (nameInput.value || '').trim();
-        const result = await postJson('/join', { name });
+        const roomCode = normalizeRoomCode(roomInput.value);
+
+        const result = await postJson('/join', { name, roomCode, create });
         if (result.error) {
           statusEl.textContent = 'Estado: No se pudo entrar';
           setMessage(result.error);
           return;
         }
+
         myId = result.playerId;
-        statusEl.textContent = 'Estado: Dentro de la partida. Muévete con WASD o flechas.';
+        myRoomCode = result.roomCode;
+        roomInput.value = myRoomCode;
+        roomCodeEl.textContent = myRoomCode;
+        statusEl.textContent = `Estado: En sala ${myRoomCode}. Muévete con WASD o flechas.`;
+        setMessage(`Entraste a la sala ${myRoomCode}. Comparte ese código con tus amigos.`);
       }
 
       async function sendInput() {
@@ -156,12 +175,18 @@
         }
       });
 
-      joinBtn.addEventListener('click', joinGame);
+      joinBtn.addEventListener('click', () => enterRoom(false));
+      createBtn.addEventListener('click', () => enterRoom(true));
 
       async function pollState() {
         try {
           const res = await fetch(`/state?playerId=${encodeURIComponent(myId || '')}`, { cache: 'no-store' });
           state = await res.json();
+
+          if (state.roomCode) {
+            roomCodeEl.textContent = state.roomCode;
+            myRoomCode = state.roomCode;
+          }
 
           if (state.events && state.events.length) {
             const newest = state.events[state.events.length - 1];
@@ -171,15 +196,17 @@
             }
           }
 
-          if (myId && state.players[myId]) {
+          if (myId && state.players && state.players[myId]) {
             const me = state.players[myId];
             const cls = me.isIt ? 'tagged' : 'not-tagged';
-            statusEl.innerHTML = `Estado: <span class="${cls}">${me.isIt ? 'ERES LA LLEVA' : 'No eres la lleva'}</span> | Jugadores: ${state.playerCount}/4`;
-          } else if (myId && !state.players[myId]) {
+            statusEl.innerHTML = `Estado: Sala <span class="room-code">${myRoomCode}</span> | <span class="${cls}">${me.isIt ? 'ERES LA LLEVA' : 'No eres la lleva'}</span> | Jugadores: ${state.playerCount}/4`;
+          } else if (myId && (!state.players || !state.players[myId])) {
             myId = null;
-            statusEl.textContent = 'Estado: Fuiste desconectado por inactividad.';
+            myRoomCode = null;
+            roomCodeEl.textContent = '-';
+            statusEl.textContent = 'Estado: Ya no estás en una sala. Crea o únete de nuevo.';
           } else {
-            statusEl.textContent = `Estado: Esperando entrada (${state.playerCount}/4)`;
+            statusEl.textContent = 'Estado: Elige crear o unirte a una sala.';
           }
 
           scoresEl.innerHTML = '';

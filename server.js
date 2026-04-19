@@ -12,24 +12,70 @@ const PLAYER_SPEED = 320;
 const TAG_DISTANCE = PLAYER_RADIUS * 2 + 4;
 const TAG_COOLDOWN_MS = 1200;
 const PLAYER_TIMEOUT_MS = 15000;
+const ROOM_CODE_LEN = 6;
 
-const players = {};
-let itId = null;
-let lastTagAt = 0;
-let lastTick = Date.now();
-const recentEvents = [];
+/** @type {Record<string, {code: string, players: Record<string, any>, itId: string | null, lastTagAt: number, lastTick: number, recentEvents: Array<{at:number,type:string,message:string}>}>} */
+const rooms = {};
+/** @type {Record<string, string>} */
+const playerRoomById = {};
 
 function nowMs() {
   return Date.now();
 }
 
-function pushEvent(type, message) {
-  recentEvents.push({ at: nowMs(), type, message });
-  while (recentEvents.length > 40) recentEvents.shift();
+function sanitizeName(name) {
+  if (typeof name !== 'string') return 'Jugador';
+  const trimmed = name.trim().slice(0, 20);
+  return trimmed || 'Jugador';
 }
 
-function countPlayers() {
-  return Object.keys(players).length;
+function sanitizeRoomCode(code) {
+  if (typeof code !== 'string') return '';
+  return code.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 12);
+}
+
+function randomRoomCode() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let code = '';
+  for (let i = 0; i < ROOM_CODE_LEN; i += 1) {
+    code += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return code;
+}
+
+function generateUniqueRoomCode() {
+  for (let i = 0; i < 50; i += 1) {
+    const code = randomRoomCode();
+    if (!rooms[code]) return code;
+  }
+  return `${randomRoomCode()}${Math.floor(Math.random() * 9)}`;
+}
+
+function getRoom(code) {
+  return rooms[code] || null;
+}
+
+function createRoom(roomCode) {
+  const code = sanitizeRoomCode(roomCode) || generateUniqueRoomCode();
+  if (rooms[code]) return null;
+  rooms[code] = {
+    code,
+    players: {},
+    itId: null,
+    lastTagAt: 0,
+    lastTick: nowMs(),
+    recentEvents: [],
+  };
+  return rooms[code];
+}
+
+function pushRoomEvent(room, type, message) {
+  room.recentEvents.push({ at: nowMs(), type, message });
+  while (room.recentEvents.length > 40) room.recentEvents.shift();
+}
+
+function roomPlayerCount(room) {
+  return Object.keys(room.players).length;
 }
 
 function clamp(value, min, max) {
@@ -44,34 +90,29 @@ function randomSpawn() {
   };
 }
 
-function pickRandomPlayerId() {
-  const ids = Object.keys(players);
+function pickRandomPlayerId(room) {
+  const ids = Object.keys(room.players);
   if (!ids.length) return null;
   return ids[Math.floor(Math.random() * ids.length)];
 }
 
-function sanitizeName(name) {
-  if (typeof name !== 'string') return 'Jugador';
-  const trimmed = name.trim().slice(0, 20);
-  return trimmed || 'Jugador';
-}
-
-function ensureValidIt() {
-  if (!itId || !players[itId]) {
-    itId = pickRandomPlayerId();
-    lastTagAt = nowMs();
+function ensureValidIt(room) {
+  if (!room.itId || !room.players[room.itId]) {
+    room.itId = pickRandomPlayerId(room);
+    room.lastTagAt = nowMs();
   }
 }
 
-function publicState() {
+function buildRoomState(room) {
   return {
+    roomCode: room.code,
     width: WIDTH,
     height: HEIGHT,
     maxPlayers: MAX_PLAYERS,
-    playerCount: countPlayers(),
-    itId,
+    playerCount: roomPlayerCount(room),
+    itId: room.itId,
     players: Object.fromEntries(
-      Object.entries(players).map(([id, p]) => [
+      Object.entries(room.players).map(([id, p]) => [
         id,
         {
           id,
@@ -79,24 +120,24 @@ function publicState() {
           x: p.x,
           y: p.y,
           radius: PLAYER_RADIUS,
-          isIt: id === itId,
+          isIt: id === room.itId,
           notItTimeMs: p.notItTimeMs,
         },
       ])
     ),
-    leaderboard: Object.values(players)
+    leaderboard: Object.values(room.players)
       .map((p) => ({ name: p.name, notItTimeMs: p.notItTimeMs }))
       .sort((a, b) => b.notItTimeMs - a.notItTimeMs)
       .slice(0, MAX_PLAYERS),
-    events: recentEvents,
+    events: room.recentEvents,
     serverTime: nowMs(),
   };
 }
 
-function createPlayer(name) {
+function createPlayer(room, name) {
   const id = crypto.randomBytes(12).toString('hex');
   const spawn = randomSpawn();
-  players[id] = {
+  room.players[id] = {
     id,
     name,
     x: spawn.x,
@@ -105,22 +146,57 @@ function createPlayer(name) {
     notItTimeMs: 0,
     lastSeenAt: nowMs(),
   };
+  playerRoomById[id] = room.code;
   return id;
 }
 
-function removePlayer(playerId, reason = 'salió') {
-  const p = players[playerId];
-  if (!p) return;
-  const wasIt = playerId === itId;
-  const leftName = p.name;
-  delete players[playerId];
-  if (wasIt) itId = null;
-  ensureValidIt();
-  pushEvent('system', `${leftName} ${reason} (${countPlayers()}/${MAX_PLAYERS})`);
+function maybeDeleteRoom(room) {
+  if (roomPlayerCount(room) === 0) {
+    delete rooms[room.code];
+  }
 }
 
-function updatePlayerMovement(dtSec) {
-  for (const p of Object.values(players)) {
+function removePlayer(playerId, reason = 'salió') {
+  const roomCode = playerRoomById[playerId];
+  if (!roomCode) return;
+  const room = rooms[roomCode];
+  if (!room) {
+    delete playerRoomById[playerId];
+    return;
+  }
+
+  const p = room.players[playerId];
+  if (!p) {
+    delete playerRoomById[playerId];
+    maybeDeleteRoom(room);
+    return;
+  }
+
+  const wasIt = playerId === room.itId;
+  const leftName = p.name;
+
+  delete room.players[playerId];
+  delete playerRoomById[playerId];
+
+  if (wasIt) room.itId = null;
+  ensureValidIt(room);
+
+  pushRoomEvent(room, 'system', `${leftName} ${reason} (${roomPlayerCount(room)}/${MAX_PLAYERS})`);
+  maybeDeleteRoom(room);
+}
+
+function updateRoom(room) {
+  const current = nowMs();
+  const dtMs = current - room.lastTick;
+  room.lastTick = current;
+
+  if (!roomPlayerCount(room)) {
+    return;
+  }
+
+  const dtSec = dtMs / 1000;
+
+  for (const p of Object.values(room.players)) {
     let dx = 0;
     let dy = 0;
 
@@ -137,35 +213,30 @@ function updatePlayerMovement(dtSec) {
       p.y = clamp(p.y + dy * PLAYER_SPEED * dtSec, PLAYER_RADIUS, HEIGHT - PLAYER_RADIUS);
     }
   }
-}
 
-function updateSurvivalTime(dtMs) {
-  for (const [id, p] of Object.entries(players)) {
-    if (id !== itId) p.notItTimeMs += dtMs;
+  for (const [id, p] of Object.entries(room.players)) {
+    if (id !== room.itId) p.notItTimeMs += dtMs;
   }
-}
 
-function tryTag() {
-  if (!itId || !players[itId]) return;
-  const now = nowMs();
-  if (now - lastTagAt < TAG_COOLDOWN_MS) return;
-
-  const itPlayer = players[itId];
-  for (const [id, p] of Object.entries(players)) {
-    if (id === itId) continue;
-    const dist = Math.hypot(itPlayer.x - p.x, itPlayer.y - p.y);
-    if (dist <= TAG_DISTANCE) {
-      itId = id;
-      lastTagAt = now;
-      pushEvent('tag', `${itPlayer.name} tocó a ${p.name}. ¡La lleva cambia!`);
-      break;
+  if (room.itId && room.players[room.itId]) {
+    const now = nowMs();
+    if (now - room.lastTagAt >= TAG_COOLDOWN_MS) {
+      const itPlayer = room.players[room.itId];
+      for (const [id, p] of Object.entries(room.players)) {
+        if (id === room.itId) continue;
+        const dist = Math.hypot(itPlayer.x - p.x, itPlayer.y - p.y);
+        if (dist <= TAG_DISTANCE) {
+          room.itId = id;
+          room.lastTagAt = now;
+          pushRoomEvent(room, 'tag', `${itPlayer.name} tocó a ${p.name}. ¡La lleva cambia!`);
+          break;
+        }
+      }
     }
   }
-}
 
-function purgeInactivePlayers() {
   const cutoff = nowMs() - PLAYER_TIMEOUT_MS;
-  for (const p of Object.values(players)) {
+  for (const p of Object.values(room.players)) {
     if (p.lastSeenAt < cutoff) {
       removePlayer(p.id, 'se desconectó');
     }
@@ -232,13 +303,40 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'POST' && url.pathname === '/join') {
     try {
       const body = await readJsonBody(req);
-      if (countPlayers() >= MAX_PLAYERS) {
-        return sendJson(res, 403, { error: 'Sala llena (4/4).' });
+      const name = sanitizeName(body.name);
+      const requestedCode = sanitizeRoomCode(body.roomCode);
+      const create = Boolean(body.create);
+
+      let room = null;
+
+      if (create) {
+        if (requestedCode && rooms[requestedCode]) {
+          return sendJson(res, 409, { error: 'Ese código de sala ya existe.' });
+        }
+        room = createRoom(requestedCode || generateUniqueRoomCode());
+      } else {
+        if (!requestedCode) {
+          return sendJson(res, 400, { error: 'Debes ingresar un código de sala.' });
+        }
+        room = getRoom(requestedCode);
+        if (!room) {
+          return sendJson(res, 404, { error: 'La sala no existe.' });
+        }
       }
-      const playerId = createPlayer(sanitizeName(body.name));
-      ensureValidIt();
-      pushEvent('system', `${players[playerId].name} se unió (${countPlayers()}/${MAX_PLAYERS})`);
-      return sendJson(res, 200, { playerId, maxPlayers: MAX_PLAYERS });
+
+      if (!room) {
+        return sendJson(res, 500, { error: 'No se pudo crear/encontrar la sala.' });
+      }
+
+      if (roomPlayerCount(room) >= MAX_PLAYERS) {
+        return sendJson(res, 403, { error: `Sala ${room.code} llena (4/4).` });
+      }
+
+      const playerId = createPlayer(room, name);
+      ensureValidIt(room);
+      pushRoomEvent(room, 'system', `${room.players[playerId].name} se unió (${roomPlayerCount(room)}/${MAX_PLAYERS})`);
+
+      return sendJson(res, 200, { playerId, roomCode: room.code, maxPlayers: MAX_PLAYERS });
     } catch (err) {
       return sendJson(res, 400, { error: `Solicitud inválida: ${err.message}` });
     }
@@ -247,14 +345,18 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'POST' && url.pathname === '/input') {
     try {
       const body = await readJsonBody(req);
-      const player = players[body.playerId];
+      const roomCode = playerRoomById[body.playerId];
+      const room = roomCode ? rooms[roomCode] : null;
+      const player = room ? room.players[body.playerId] : null;
       if (!player) return sendJson(res, 404, { error: 'Jugador no encontrado' });
+
       const input = body.input || {};
       player.input.up = Boolean(input.up);
       player.input.down = Boolean(input.down);
       player.input.left = Boolean(input.left);
       player.input.right = Boolean(input.right);
       player.lastSeenAt = nowMs();
+
       return sendJson(res, 200, { ok: true });
     } catch (err) {
       return sendJson(res, 400, { error: `Solicitud inválida: ${err.message}` });
@@ -273,25 +375,37 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'GET' && url.pathname === '/state') {
     const playerId = url.searchParams.get('playerId') || '';
-    const player = players[playerId];
+    const roomCode = playerRoomById[playerId];
+    const room = roomCode ? rooms[roomCode] : null;
+
+    if (!room) {
+      return sendJson(res, 200, {
+        roomCode: null,
+        width: WIDTH,
+        height: HEIGHT,
+        maxPlayers: MAX_PLAYERS,
+        playerCount: 0,
+        itId: null,
+        players: {},
+        leaderboard: [],
+        events: [],
+        serverTime: nowMs(),
+      });
+    }
+
+    const player = room.players[playerId];
     if (player) player.lastSeenAt = nowMs();
-    return sendJson(res, 200, publicState());
+
+    return sendJson(res, 200, buildRoomState(room));
   }
 
   return sendJson(res, 404, { error: 'Ruta no encontrada' });
 });
 
 setInterval(() => {
-  const current = nowMs();
-  const dtMs = current - lastTick;
-  lastTick = current;
-
-  if (!countPlayers()) return;
-
-  updatePlayerMovement(dtMs / 1000);
-  updateSurvivalTime(dtMs);
-  tryTag();
-  purgeInactivePlayers();
+  for (const room of Object.values(rooms)) {
+    updateRoom(room);
+  }
 }, 1000 / 30);
 
 server.listen(PORT, () => {
